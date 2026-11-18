@@ -850,8 +850,91 @@ def check_version_info(target_url, auth):
 # PT-WEB-37: Unsafe CORS Configuration
 # ---------------------------------------------------------------------------
 
+API_PROBE_PATHS = [
+    "/graphql", "/api", "/api/v1", "/api/v2", "/api/v3",
+    "/rest", "/rest/v1", "/v1", "/v2",
+    "/oauth/token", "/auth", "/login",
+    "/ws", "/websocket", "/hub", "/signalr",
+]
+
+
+def _cors_test_url(url, evil_origins, auth):
+    """Test a single URL against all evil origins. Returns list of finding strings."""
+    findings = []
+    for origin in evil_origins:
+        try:
+            kw = requests_kwargs(auth)
+            kw["headers"]["Origin"] = origin
+            kw["allow_redirects"] = True
+            resp = requests.get(url, **kw)
+            acao = resp.headers.get("Access-Control-Allow-Origin", "")
+            acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+
+            if not acao:
+                continue
+
+            if acao == "*":
+                findings.append(colored(
+                    f"  ❌ ACAO is wildcard '*' on {url}", "red"))
+                findings.append(colored(
+                    f"     Origin sent: {origin}", "red"))
+                findings.append(colored(
+                    "     Any website can read responses from this endpoint.", "red"))
+                if acac.lower() == "true":
+                    findings.append(colored(
+                        "     AND Access-Control-Allow-Credentials: true!", "red"))
+                    findings.append(colored(
+                        "     Browsers ignore credentials with wildcard ACAO, but this", "red"))
+                    findings.append(colored(
+                        "     misconfiguration signals a broken CORS implementation.", "red"))
+                findings.append("")
+
+            elif acao.lower() == origin.lower():
+                findings.append(colored(
+                    f"  ❌ ACAO reflects attacker origin on {url}", "red"))
+                findings.append(colored(
+                    f"     Origin sent: {origin}  |  ACAO returned: {acao}", "red"))
+                if acac.lower() == "true":
+                    findings.append(colored(
+                        "     AND Access-Control-Allow-Credentials: true!", "red"))
+                    findings.append(colored(
+                        "     An attacker's page can read authenticated responses from", "red"))
+                    findings.append(colored(
+                        "     this endpoint, stealing sensitive user data cross-site.", "red"))
+                else:
+                    findings.append(colored(
+                        "     Origin reflection without credentials is lower risk but", "yellow"))
+                    findings.append(colored(
+                        "     still allows unauthenticated data to be read cross-origin.", "yellow"))
+                findings.append("")
+
+            elif acao.lower() == "null" and origin == "null":
+                findings.append(colored(
+                    f"  ❌ ACAO reflects 'null' origin on {url}", "red"))
+                findings.append(colored(
+                    f"     ACAO: {acao}  |  Credentials: {acac}", "red"))
+                findings.append(colored(
+                    "     Sandboxed iframes and data: URIs send Origin: null.", "red"))
+                findings.append(colored(
+                    "     An attacker can use a sandboxed iframe to match this.", "red"))
+                if acac.lower() == "true":
+                    findings.append(colored(
+                        "     WITH Access-Control-Allow-Credentials: true!", "red"))
+                    findings.append(colored(
+                        "     This allows an attacker to read authenticated responses", "red"))
+                    findings.append(colored(
+                        "     from a sandboxed context, exfiltrating user data.", "red"))
+                findings.append("")
+
+        except Exception:
+            continue
+
+    return findings
+
+
 def check_cors(target_url, auth):
-    """Send requests with crafted Origin headers to test CORS policy."""
+    """Send requests with crafted Origin headers to test CORS policy.
+    Tests the target URL itself plus common API endpoint paths."""
     print(colored(f"\n[+] Running CORS Configuration Check on {target_url}", "cyan"))
     output = []
     parsed = urlparse(target_url)
@@ -862,62 +945,27 @@ def check_cors(target_url, auth):
         "null",                                 # null origin
     ]
 
-    try:
-        for origin in evil_origins:
-            kw = requests_kwargs(auth)
-            kw["headers"]["Origin"] = origin
-            kw["allow_redirects"] = True
-            resp = requests.get(target_url, **kw)
-            acao = resp.headers.get("Access-Control-Allow-Origin", "")
-            acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+    # Build list of URLs to test: the target itself + common API paths on the same host
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    urls_to_test = [target_url]
+    for path in API_PROBE_PATHS:
+        probe_url = base_url + path
+        if probe_url != target_url:
+            urls_to_test.append(probe_url)
 
-            if not acao:
-                continue
-
-            if acao == "*":
-                output.append(colored(
-                    f"  ❌ ACAO is wildcard '*' (Origin sent: {origin})", "red"))
-                output.append(colored(
-                    "     Any website can read responses from this endpoint.", "red"))
-                if acac.lower() == "true":
-                    output.append(colored(
-                        "     AND Access-Control-Allow-Credentials: true!", "red"))
-                    output.append(colored(
-                        "     ⚠️  Browsers ignore credentials with wildcard ACAO, but this", "red"))
-                    output.append(colored(
-                        "     misconfiguration signals a broken CORS implementation.", "red"))
-
-            elif acao.lower() == origin.lower():
-                output.append(colored(
-                    f"  ❌ ACAO reflects attacker origin: {origin}", "red"))
-                if acac.lower() == "true":
-                    output.append(colored(
-                        "     AND Access-Control-Allow-Credentials: true!", "red"))
-                    output.append(colored(
-                        "     An attacker's page can read authenticated responses from", "red"))
-                    output.append(colored(
-                        "     this endpoint, stealing sensitive user data cross-site.", "red"))
-                else:
-                    output.append(colored(
-                        "     Origin reflection without credentials is lower risk but", "yellow"))
-                    output.append(colored(
-                        "     still allows unauthenticated data to be read cross-origin.", "yellow"))
-
-            elif acao.lower() == "null" and origin == "null":
-                output.append(colored(
-                    "  ❌ ACAO reflects 'null' origin", "red"))
-                output.append(colored(
-                    "     Sandboxed iframes and data: URIs send Origin: null.", "red"))
-                output.append(colored(
-                    "     An attacker can use a sandboxed iframe to match this.", "red"))
-
-    except Exception as e:
-        output.append(colored(f"  ❌ Error during CORS check: {e}", "red"))
+    tested = 0
+    for url in urls_to_test:
+        findings = _cors_test_url(url, evil_origins, auth)
+        if findings:
+            output.extend(findings)
+        tested += 1
 
     if not output:
-        output.append(colored("  ✅ No unsafe CORS configuration detected.", "green"))
+        output.append(colored(
+            f"  ✅ No unsafe CORS configuration detected ({tested} endpoints probed).", "green"))
     else:
-        output.append("")
+        output.append(colored(
+            f"  Tested {tested} endpoints on {parsed.netloc}", "white"))
         output.append(colored(
             "  Ref: https://portswigger.net/web-security/cors", "cyan"))
 
